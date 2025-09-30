@@ -1,0 +1,10 @@
+# ignore everything by default
+**
+
+# allow only the files that Dockerfile COPY usa
+!two_stage_app.py
+!splitting/
+!splitting/infer_splitter.py
+!storytelling/
+!storytelling/infer_from_splits.py
+!Dockerfile

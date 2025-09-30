@@ -1,0 +1,65 @@
+# Ignore EVERYTHING by default
+/*
+splitting/**
+!splitting/infer_splitter.py
+!splitting/__init__.py
+
+storytelling/**
+!storytelling/infer_from_splits.py
+!storytelling/__init__.py
+
+**/outputs/**
+**/*.json
+**/*.csv
+**/*.tsv
+**/*.txt
+**/*.md
+
+hf/
+hf-cache/
+.huggingface/
+transformers_cache/
+datasets/
+models/
+checkpoints/
+outputs/
+logs/
+*.pt
+*.bin
+*.safetensors
+*.onnx
+
+# python junk
+__pycache__/
+*.pyc
+*.pyo
+
+# venv
+.venv/
+venv/
+env/
+
+# docker
+Dockerfile.*
+docker-compose*.yml
+
+# editor
+.DS_Store
+.vscode/
+.idea/
+
+# --- Whitelist ONLY what's needed to build & run inference ---
+!.gitignore
+!README.md
+!Dockerfile
+!.dockerignore
+!.env.example
+
+!two_stage_app.py
+
+# keep these folders but only selected files inside
+!splitting/
+!splitting/infer_splitter.py
+
+!storytelling/
+!storytelling/infer_from_splits.py
