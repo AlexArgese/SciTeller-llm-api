@@ -18,7 +18,7 @@ RUN pip3 install --no-cache-dir \
 # 2) PyPI
 RUN pip3 install --no-cache-dir \
     fastapi==0.111.0 uvicorn[standard]==0.30.0 \
-    transformers==4.43.3 peft==0.11.1 datasets==2.20.0 \
+    transformers==4.43.3 peft==0.14.0 datasets==2.20.0 \
     sentence-transformers==2.7.0 scikit-learn==1.5.1 \
     bitsandbytes==0.43.3 accelerate==0.33.0 pynvml==11.5.0
 
