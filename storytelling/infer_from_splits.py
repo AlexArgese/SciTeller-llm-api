@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # infer_from_splits.py — storyteller per-sezione con RETRIEVAL (semantico o TF-IDF)
 import os, re, json, argparse, math
 from typing import Dict, Any, List, Tuple
@@ -41,6 +42,7 @@ STRICT_RULES_TEMPLATE = (
     "- Do NOT copy long passages verbatim; paraphrase faithfully.\n"
     "- No prefaces or explanations; return only the JSON object.\n"
     "- Use ONLY English.\n"
+    "- IMPORTANT: Never nest the section object under a key named after the section (e.g., no {{\\\"Background\\\": {{...}}}}).\n"
 )
 
 BF16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
@@ -52,7 +54,7 @@ def length_rule_from_preset(preset: str) -> str:
     return "- Keep sections concise: ~2–3 short paragraphs each."
 
 # ===============================
-# JSON helpers
+# JSON / text helpers
 # ===============================
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
@@ -80,6 +82,14 @@ def extract_first_json_object(s: str) -> str:
         i += 1
     return s[start:].strip()
 
+def _clean_plain_text(txt: str) -> str:
+    # pulizia leggera finale per prosa: niente fence, niente doppi apici isolati, compattazione newline
+    t = _strip_code_fences(str(txt))
+    t = t.strip().strip('"').strip("'")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
 # ===============================
 # Anti-hallucination helpers
 # ===============================
@@ -99,6 +109,7 @@ def reinforce_no_hallu(prompt:str, chunk_note:str="context chunk"):
         f"- DO NOT invent names/affiliations.\n"
         f"- If authors are anonymized, say 'the authors' / 'the framework'.\n"
         f"- Use only entities explicitly present in the {chunk_note}.\n"
+        "- If the context does not include an information, write 'not specified in the paper'."
     )
     return prompt + extra
 
@@ -217,6 +228,8 @@ def build_section_prompt(persona:str, paper_title:str, target_title:str, target_
         "- Generate exactly ONE section object matching the provided title.\n",
         rules_single, flags=re.M,
     )
+    rules_single += "\n- Do NOT nest the section under a key named after the section (e.g., no {\"%s\": {...}}). Return ONLY {\"title\":\"%s\",\"text\":\"...\"}.\n" % (target_title.replace('"','\\"'), target_title.replace('"','\\"'))
+    rules_single += "\n- IMPORTANT: Write in English only, never use Chinese or other characters.\n"
     parts = [
         rules_single,
         "\nTarget section:\n- Title: " + target_title
@@ -228,8 +241,10 @@ def build_section_prompt(persona:str, paper_title:str, target_title:str, target_
     parts.append(
         "\nSTRICT ENTITY RULES:\n"
         "- Mention organizations/people ONLY if they appear verbatim in the retrieved context above.\n"
-        "- If not present, use neutral phrases like 'the authors' or 'the framework'."
+        "- If not present, use neutral phrases like 'the authors' or 'the framework'.\n"
+        "- If some information is missing from the context, write 'not specified in the paper'."
     )
+    parts.append("\nLanguage requirement: Write in English only. Never use Chinese/Japanese/Korean characters.")
     return "\n".join(parts)
 
 def build_title_prompt(persona:str, paper_title:str, outline_titles:List[str], length_preset:str="medium") -> str:
@@ -297,8 +312,8 @@ def main():
     # retrieval
     ap.add_argument("--retriever", default="auto", help="auto|emb|tfidf")
     ap.add_argument("--retriever_model", default="sentence-transformers/all-MiniLM-L6-v2")
-    ap.add_argument("--k", type=int, default=6, help="top-k paragrafi per sezione")
-    ap.add_argument("--max_ctx_chars", type=int, default=2500)
+    ap.add_argument("--k", type=int, default=3, help="top-k paragrafi per sezione (default 3 per meno rumore)")
+    ap.add_argument("--max_ctx_chars", type=int, default=1400)
     ap.add_argument("--seg_words", type=int, default=180)
     ap.add_argument("--overlap_words", type=int, default=60)
     args = ap.parse_args()
@@ -306,8 +321,12 @@ def main():
     # modello
     tok, model = load_model_and_tokenizer(args.adapter)
 
+    # clamp anti-hallucination (utile anche se chiamato standalone)
+    temp  = min(float(args.temperature), 0.7)
+    top_p = min(float(args.top_p), 0.85)
+
     # config generazione
-    do_sample = float(args.temperature) > 0.0
+    do_sample = temp > 0.0
     base_cfg = dict(
         pad_token_id=tok.pad_token_id,
         eos_token_id=tok.eos_token_id,
@@ -338,16 +357,23 @@ def main():
 
             # budget per sezione
             per_sec_max = max(220, int(args.max_new_tokens // max(1, target_n)))
-            per_sec_min = max(80,  int(args.min_new_tokens // max(1, target_n)))
+            # preset-aware minimums
+            preset = (args.preset or "medium").lower()
+            if preset == "short":
+                per_sec_min = 0
+            elif preset == "long":
+                per_sec_min = max(120,  int(args.min_new_tokens // max(1, target_n)))
+            else:
+                per_sec_min = max(60,   int(args.min_new_tokens // max(1, target_n)))
 
             if do_sample:
                 gen_cfg = GenerationConfig(
                     max_new_tokens=per_sec_max,
                     min_new_tokens=per_sec_min if per_sec_min > 0 else None,
                     do_sample=True,
-                    temperature=float(args.temperature),
-                    top_p=float(args.top_p),
-                    repetition_penalty=1.05,
+                    temperature=temp,
+                    top_p=top_p,
+                    repetition_penalty=1.10,
                     **base_cfg,
                 )
             else:
@@ -365,7 +391,7 @@ def main():
                 sec_title = (sec.get("title") or f"Section {i+1}").strip()
                 sec_desc  = (sec.get("description") or "").strip()
 
-                # === CONTEX RETRIEVAL per sezione ===
+                # === CONTEXT RETRIEVAL per sezione ===
                 ctx_i = build_section_context(
                     sec_title, sec_desc, ret,
                     k=args.k, max_chars=args.max_ctx_chars
@@ -433,15 +459,37 @@ def main():
                                             out_sec["text"] = only_v["text"].strip()
                             except Exception:
                                 pass
+
+                        # 5) hard-unwrap finale: se restano graffe/JSON-like nel text, ripulisci
+                        if out_sec["text"] and "{" in out_sec["text"] and "}" in out_sec["text"] and ":" in out_sec["text"]:
+                            # prova ancora un parse
+                            try:
+                                inner2 = json.loads(out_sec["text"])
+                                if isinstance(inner2, dict) and isinstance(inner2.get("text"), str):
+                                    out_sec["text"] = inner2["text"].strip()
+                            except Exception:
+                                # fallback: rimuovi delimitatori lasciando plain text
+                                out_sec["text"] = re.sub(r"[{}\[\]\"]", "", out_sec["text"]).strip()
+
                 except Exception:
                     raw = _strip_code_fences(gen_full).strip()
                     paras = re.split(r"\n\s*\n", raw)
                     paras = [p.strip() for p in paras if p.strip()]
                     out_sec["text"] = "\n\n".join(paras[:4]) if paras else raw[:1200]
 
+                # seed se ancora vuoto
                 if not out_sec["text"].strip():
                     seed = sec_desc or ctx_i[:600].strip() or ""
                     out_sec["text"] = seed
+
+                # pulizia finale prosa
+                out_sec["text"] = _clean_plain_text(out_sec["text"])
+                out_sec["text"] = re.sub(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+', '', out_sec["text"]).strip()
+                paras = [p.strip() for p in re.split(r"\n{2,}", out_sec["text"]) if p.strip()]
+                if not paras:
+                    paras = re.split(r'(?<=[.!?])\s+(?=[A-ZÀ-ÖØ-Ý])', out_sec["text"])
+                out_sec["text"] = "\n\n".join([p for p in paras if p])
+
 
                 if out_sec["text"].strip(): valid_count += 1
                 sections_out.append(out_sec)
@@ -451,6 +499,12 @@ def main():
             title_cfg = GenerationConfig(max_new_tokens=32, **base_cfg)
             title_raw = generate_once(tok, model, title_prompt, title_cfg).strip()
             title_line = title_raw.splitlines()[0].strip().strip('"').strip("'")
+            # hard clean
+            title_line = re.sub(r'^(Human|User|Assistant|System)\s*:\s*', '', title_line, flags=re.I)
+            title_line = re.sub(r'["`]+.*$', '', title_line).strip()  
+            title_line = re.sub(r'\s{2,}', ' ', title_line).strip()
+            title_line = re.sub(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+', '', title_line).strip()
+
             if outline_titles and title_line.lower() == outline_titles[0].lower():
                 title_line = f"{title_line}: An Overview"
 
@@ -470,7 +524,7 @@ def main():
             if valid_count >= max(1, target_n - 1):
                 ok += 1
 
-    print(f"[DONE] items={n_items}  ok(items with most sections filled)={ok}  rate={ok/max(1,n_items):.3f}")
+    print(f"[DONE] items={n_items}  ok(items with most sections filled)={ok/max(1,n_items):.3f}")
 
 if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")

@@ -250,6 +250,12 @@ def _maybe_unwrap_json_text(txt: str, curr_title: str) -> str:
                 continue
     return s
 
+def _split_paragraphs(text: str) -> list[str]:
+    parts = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    if not parts:
+        parts = re.split(r'(?<=[.!?])\s+(?=[A-ZÀ-ÖØ-Ý])', text)
+    return [p.strip() for p in parts if p.strip()]
+
 # =========================
 # Endpoint principale (split + story)
 # =========================
@@ -273,6 +279,8 @@ def two_stage_story(req: TwoStageRequest, x_api_key: Optional[str] = Header(defa
     st_preset     = (req.storyteller.preset if (req.storyteller and req.storyteller.preset) else "medium").lower()
     st_temp       = float(req.storyteller.temperature) if (req.storyteller and req.storyteller.temperature is not None) else 0.0
     st_top_p      = float(req.storyteller.top_p) if (req.storyteller and req.storyteller.top_p is not None) else 0.9
+    st_temp  = min(st_temp, 0.7)
+    st_top_p = min(st_top_p, 0.85)
     st_max_new    = int(req.storyteller.max_new_tokens) if (req.storyteller and req.storyteller.max_new_tokens is not None) else 1500
     st_min_new    = int(req.storyteller.min_new_tokens) if (req.storyteller and req.storyteller.min_new_tokens is not None) else 600
     st_target_w   = int(req.storyteller.target_words) if (req.storyteller and req.storyteller.target_words is not None) else None
@@ -280,8 +288,8 @@ def two_stage_story(req: TwoStageRequest, x_api_key: Optional[str] = Header(defa
     # === NEW: defaults retrieval storyteller ===
     st_retriever       = (req.storyteller.retriever       if (req.storyteller and req.storyteller.retriever       is not None) else "auto")
     st_retriever_model = (req.storyteller.retriever_model if (req.storyteller and req.storyteller.retriever_model is not None) else "sentence-transformers/all-MiniLM-L6-v2")
-    st_k               = (int(req.storyteller.k)               if (req.storyteller and req.storyteller.k               is not None) else 6)
-    st_max_ctx_chars   = (int(req.storyteller.max_ctx_chars)   if (req.storyteller and req.storyteller.max_ctx_chars   is not None) else 2500)
+    st_k               = (int(req.storyteller.k)               if (req.storyteller and req.storyteller.k               is not None) else 3)
+    st_max_ctx_chars   = (int(req.storyteller.max_ctx_chars)   if (req.storyteller and req.storyteller.max_ctx_chars   is not None) else 1400)
     st_seg_words       = (int(req.storyteller.seg_words)       if (req.storyteller and req.storyteller.seg_words       is not None) else 180)
     st_overlap_words   = (int(req.storyteller.overlap_words)   if (req.storyteller and req.storyteller.overlap_words   is not None) else 60)
 
@@ -374,7 +382,11 @@ def two_stage_story(req: TwoStageRequest, x_api_key: Optional[str] = Header(defa
                     text = (desc or "").strip()
                 except Exception:
                     text = ""
-            norm_sections.append({"title": title, "text": text})
+            norm_sections.append({
+                "title": title,
+                "text": text,
+                "paragraphs": _split_paragraphs(text),
+            })
         sections = norm_sections
 
         # Titolo
@@ -470,14 +482,16 @@ def two_stage_story_from_outline(req: TwoStageFromOutlineReq, x_api_key: Optiona
     st_preset   = (st.preset or "medium").lower()
     st_temp     = float(st.temperature) if st.temperature is not None else 0.0
     st_top_p    = float(st.top_p) if st.top_p is not None else 0.9
+    st_temp  = min(st_temp, 0.7)
+    st_top_p = min(st_top_p, 0.85)
     st_max_new  = int(st.max_new_tokens) if st.max_new_tokens is not None else 1500
     st_min_new  = int(st.min_new_tokens) if st.min_new_tokens is not None else 600
 
     # retrieval knobs (default robusti)
     st_retriever       = (getattr(st, "retriever", None) or "auto")
     st_retriever_model = (getattr(st, "retriever_model", None) or "sentence-transformers/all-MiniLM-L6-v2")
-    st_k               = int(getattr(st, "k", 6) or 6)
-    st_max_ctx_chars   = int(getattr(st, "max_ctx_chars", 2500) or 2500)
+    st_k               = int(getattr(st, "k", 3) or 3)
+    st_max_ctx_chars   = int(getattr(st, "max_ctx_chars", 1400) or 1400)
     st_seg_words       = int(getattr(st, "seg_words", 180) or 180)
     st_overlap_words   = int(getattr(st, "overlap_words", 60) or 60)
 
@@ -558,7 +572,11 @@ def two_stage_story_from_outline(req: TwoStageFromOutlineReq, x_api_key: Optiona
             text = _maybe_unwrap_json_text(text, title)
             if cleaned:
                 text = _filter_unsupported(text, cleaned)
-            norm.append({"title": title, "text": text})
+            norm.append({
+                "title": title,
+                "text": text,
+                "paragraphs": _split_paragraphs(text),
+            })
 
         ret_title = _sanitize_title(gen.get("title")) if isinstance(gen, dict) else None
 
