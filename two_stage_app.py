@@ -122,6 +122,18 @@ class TwoStageResponse(BaseModel):
     meta: Dict[str, Any]
     title: Optional[str] = None
 
+class OneSectionReq(BaseModel):
+    persona: str
+    paper_title: Optional[str] = None
+    cleaned_text: str                 # markdown pulito
+    section: Dict[str, Any]           # {"title": "...", "description": "..."} (description opzionale)
+    storyteller: Optional[StoryCfg] = None
+
+class OneSectionResp(BaseModel):
+    title: str
+    text: str
+    paragraphs: List[str]
+
 # =========================
 # Helpers
 # =========================
