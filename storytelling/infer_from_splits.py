@@ -322,8 +322,8 @@ def main():
     tok, model = load_model_and_tokenizer(args.adapter)
 
     # clamp anti-hallucination (utile anche se chiamato standalone)
-    temp  = min(float(args.temperature), 0.7)
-    top_p = min(float(args.top_p), 0.85)
+    temp  = float(args.temperature)
+    top_p = float(args.top_p)
 
     # config generazione
     do_sample = temp > 0.0
