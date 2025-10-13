@@ -1,9 +1,9 @@
-# two_stage_app.py — Orchestratore SPLITTER → STORYTELLER (FastAPI su VM)
+# FILE: two_stage_app.py — Orchestratore SPLITTER → STORYTELLER (FastAPI su VM)
 # run: uvicorn two_stage_app:app --host 127.0.0.1 --port 8000 --workers 1
 
 import os, re, json, uuid, time, tempfile, subprocess, shutil, sys
 from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -29,7 +29,7 @@ TIMEOUT_STORY = int(os.getenv("TIMEOUT_STORY", "1800"))
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="Two-Stage Story Orchestrator", version="1.0.1")
+app = FastAPI(title="Two-Stage Story Orchestrator", version="1.0.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
@@ -92,12 +92,11 @@ class SplitterCfg(BaseModel):
 
 class StoryCfg(BaseModel):
     adapter: Optional[str] = None
-    preset: Optional[str] = None
+    length_preset: Optional[str] = Field(default=None, alias="preset")
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_new_tokens: Optional[int] = None
     min_new_tokens: Optional[int] = None
-    target_words: Optional[int] = None
     # === NEW: retrieval ===
     retriever: Optional[str] = None            # "auto" | "emb" | "tfidf"
     retriever_model: Optional[str] = None      # es: "sentence-transformers/all-MiniLM-L6-v2"
@@ -133,6 +132,21 @@ class OneSectionResp(BaseModel):
     title: str
     text: str
     paragraphs: List[str]
+
+# === NEW: rigenerazione parziale (API VM) ===
+class RegenSectionsVMReq(BaseModel):
+    persona: str
+    paper_title: Optional[str] = None
+    cleaned_text: str
+    outline: List[Dict[str, Any]]               # [{title, description?}] - outline completo e coerente
+    targets: List[int]                           # indici 0-based
+    storyteller: Optional[StoryCfg] = None
+
+class RegenSectionsVMResp(BaseModel):
+    persona: str
+    paper_title: Optional[str] = None
+    sections: Dict[str, Dict[str, Any]]          # mappa sparsa: {"1": {title,text,paragraphs}, ...}
+    meta: Dict[str, Any]
 
 # =========================
 # Helpers
@@ -198,18 +212,12 @@ def _extract_first_balanced_json(s: str) -> str:
 def _sanitize_title(s: str, max_words: int = 12) -> str:
     if not s: return ""
     t = str(s).strip()
-    # tieni solo la prima riga
     t = t.splitlines()[0].strip()
-    # rimuovi fence/virgolette/markdown
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I).strip()
     t = t.strip('"').strip("'").strip("`").strip()
-    # rimuovi prefissi da chat
     t = re.sub(r'^(?:Human|User|Assistant|System)\s*:\s*', '', t, flags=re.I).strip()
-    # tronca dove il modello “spiega”
     t = re.split(r'\b(?:Here it is again|It is|The title you provided)\b', t, maxsplit=1, flags=re.I)[0].strip()
-    # compatta spazi
     t = re.sub(r'\s{2,}', ' ', t)
-    # limita numero parole
     words = t.split()
     if len(words) > max_words:
         t = " ".join(words[:max_words])
@@ -221,7 +229,7 @@ def _maybe_unwrap_json_text(txt: str, curr_title: str) -> str:
         return s
     try:
         if (s.startswith('"') and s.endswith('"')) or s.startswith('\\"') or s.startswith("\\\""):
-            s = json.loads(s)  # "\"{...}\"" -> "{...}"
+            s = json.loads(s)
     except Exception:
         s = s.replace('\\"', '"').replace("\\n", "\n")
     s = _strip_code_fences(s)
@@ -288,14 +296,11 @@ def two_stage_story(req: TwoStageRequest, x_api_key: Optional[str] = Header(defa
     target_sections = max(1, int(req.target_sections or 5))
 
     story_adapter = (req.storyteller.adapter if (req.storyteller and req.storyteller.adapter) else STORYTELLER_ADAPTER)
-    st_preset     = (req.storyteller.preset if (req.storyteller and req.storyteller.preset) else "medium").lower()
+    st_preset = ((req.storyteller.length_preset if (req.storyteller and req.storyteller.length_preset) else "medium")).lower()
     st_temp       = float(req.storyteller.temperature) if (req.storyteller and req.storyteller.temperature is not None) else 0.0
     st_top_p      = float(req.storyteller.top_p) if (req.storyteller and req.storyteller.top_p is not None) else 0.9
-    # st_temp  = min(st_temp, 0.7)
-    # st_top_p = min(st_top_p, 0.85)
     st_max_new    = int(req.storyteller.max_new_tokens) if (req.storyteller and req.storyteller.max_new_tokens is not None) else 1500
     st_min_new    = int(req.storyteller.min_new_tokens) if (req.storyteller and req.storyteller.min_new_tokens is not None) else 600
-    st_target_w   = int(req.storyteller.target_words) if (req.storyteller and req.storyteller.target_words is not None) else None
 
     # === NEW: defaults retrieval storyteller ===
     st_retriever       = (req.storyteller.retriever       if (req.storyteller and req.storyteller.retriever       is not None) else "auto")
@@ -445,12 +450,11 @@ def two_stage_story(req: TwoStageRequest, x_api_key: Optional[str] = Header(defa
                 },
                 "storyteller_params": {
                     "adapter": story_adapter,
-                    "preset": st_preset,
+                    "length_preset": st_preset,
                     "temperature": st_temp,
                     "top_p": st_top_p,
                     "max_new_tokens": st_max_new,
                     "min_new_tokens": st_min_new,
-                    "target_words": st_target_w,
                     "retriever": st_retriever,
                     "retriever_model": st_retriever_model,
                     "k": st_k,
@@ -491,11 +495,9 @@ def two_stage_story_from_outline(req: TwoStageFromOutlineReq, x_api_key: Optiona
     # storyteller params (stessi default dell’altro endpoint)
     st = req.storyteller or StoryCfg()
     story_adapter = st.adapter or STORYTELLER_ADAPTER
-    st_preset   = (st.preset or "medium").lower()
+    st_preset = ((st.length_preset or "medium")).lower()
     st_temp     = float(st.temperature) if st.temperature is not None else 0.0
     st_top_p    = float(st.top_p) if st.top_p is not None else 0.9
-    st_temp  = min(st_temp, 0.7)
-    st_top_p = min(st_top_p, 0.85)
     st_max_new  = int(st.max_new_tokens) if st.max_new_tokens is not None else 1500
     st_min_new  = int(st.min_new_tokens) if st.min_new_tokens is not None else 600
 
@@ -604,7 +606,7 @@ def two_stage_story_from_outline(req: TwoStageFromOutlineReq, x_api_key: Optiona
                 "aiTitle": ret_title,                # opzionale: log titolo proposto dal modello
                 "title_source": "paper_title_locked",
                 "storyteller_params": {
-                    "preset": st_preset, "temperature": st_temp, "top_p": st_top_p,
+                    "length_preset": st_preset, "temperature": st_temp, "top_p": st_top_p,
                     "max_new_tokens": st_max_new, "min_new_tokens": st_min_new,
                     "retriever": st_retriever, "retriever_model": st_retriever_model,
                     "k": st_k, "max_ctx_chars": st_max_ctx_chars,
@@ -618,3 +620,162 @@ def two_stage_story_from_outline(req: TwoStageFromOutlineReq, x_api_key: Optiona
             shutil.rmtree(workdir, ignore_errors=True)
         except Exception:
             pass
+
+
+# =========================
+# NEW: Rigenerazione parziale (solo target) — mappa sparsa
+# =========================
+@app.post("/api/regen_sections_vm", response_model=RegenSectionsVMResp)
+def regen_sections_vm(req: RegenSectionsVMReq, x_api_key: Optional[str] = Header(default=None)):
+    """
+    Genera SOLO le sezioni indicate in `targets`, utilizzando retrieval su `cleaned_text`
+    e l'outline fornito. Restituisce una mappa sparsa { "sections": { "<idx>": {...} } }.
+    """
+    _require_api_key(x_api_key)
+
+    persona      = (req.persona or "General Public").strip()
+    paper_title  = (req.paper_title or "").strip() or None
+    cleaned_text = (req.cleaned_text or "").strip()
+    outline      = req.outline or []
+    targets_in   = req.targets or []
+
+    if not outline or not isinstance(outline, list):
+        raise HTTPException(422, "outline mancante o non valido")
+    if not cleaned_text:
+        raise HTTPException(422, "cleaned_text mancante")
+    if not targets_in:
+        raise HTTPException(400, "no valid targets")
+
+    # storyteller defaults
+    st = req.storyteller or StoryCfg()
+    story_adapter = st.adapter or STORYTELLER_ADAPTER
+    st_preset = ((st.length_preset or "medium")).lower()
+    st_temp     = float(st.temperature) if st.temperature is not None else 0.0
+    st_top_p    = float(st.top_p) if st.top_p is not None else 0.9
+    st_max_new  = int(st.max_new_tokens) if st.max_new_tokens is not None else 1500
+    st_min_new  = int(st.min_new_tokens) if st.min_new_tokens is not None else 600
+    # retrieval knobs
+    st_retriever       = (getattr(st, "retriever", None) or "auto")
+    st_retriever_model = (getattr(st, "retriever_model", None) or "sentence-transformers/all-MiniLM-L6-v2")
+    st_k               = int(getattr(st, "k", 3) or 3)
+    st_max_ctx_chars   = int(getattr(st, "max_ctx_chars", 1400) or 1400)
+    st_seg_words       = int(getattr(st, "seg_words", 180) or 180)
+    st_overlap_words   = int(getattr(st, "overlap_words", 60) or 60)
+
+    # normalizza e valida targets (0-based, nel range)
+    uniq_targets = sorted({int(t) for t in targets_in if isinstance(t, (int,))})
+    valid_targets: List[int] = []
+    for t in uniq_targets:
+        if 0 <= t < len(outline):
+            valid_targets.append(t)
+    if not valid_targets:
+        raise HTTPException(400, "no valid targets in range")
+
+    # GPU
+    chosen = pick_best_gpu(min_free_gb=6.0)
+    base_env = dict(os.environ)
+    if chosen:
+        base_env["CUDA_VISIBLE_DEVICES"] = str(chosen["index"])
+    base_env.setdefault("HF_HOME", "/docker/argese/clean_dataset/hf")
+    base_env.setdefault("OFFLOAD_FOLDER", "/docker/argese/offload")
+
+    # risposta sparsa
+    sparse_sections: Dict[str, Dict[str, Any]] = {}
+    timings: Dict[str, Any] = {"per_section_s": {}}
+    rid = str(uuid.uuid4())
+
+    # Per semplicità/robustezza richiamiamo lo storyteller una volta per target
+    # (batch singolo) passando outline con UNA sola sezione: quella target.
+    # Questo garantisce che venga rigenerata solo quella sezione.
+    for t in valid_targets:
+        start_t = time.time()
+        workdir = tempfile.mkdtemp(prefix=f"regen_{rid}_{t}_")
+        in_story = os.path.join(workdir, "in_story.jsonl")
+        out_story = os.path.join(workdir, "out_story.jsonl")
+
+        # fissa la sezione (vincolo forte sul titolo: lo imponiamo in output)
+        target_section = outline[t] or {}
+        fixed_title = (target_section.get("title") or f"Section {t+1}").strip()
+        section_record = {
+            "id": f"{rid}_{t}",
+            "persona": persona,
+            "paper_title": paper_title or "",
+            "cleaned_text": cleaned_text,
+            "sections": [ {"title": fixed_title, "description": target_section.get("description", "")} ],
+        }
+
+        try:
+            with open(in_story, "w", encoding="utf-8") as f:
+                f.write(json.dumps(section_record, ensure_ascii=False) + "\n")
+
+            cmd_story = [
+                PY, STORYTELLER_SCRIPT,
+                "--in_jsonl", in_story,
+                "--out_jsonl", out_story,
+                "--adapter", story_adapter,
+                "--preset", st_preset,
+                "--temperature", str(st_temp),
+                "--top_p", str(st_top_p),
+                "--max_new_tokens", str(st_max_new),
+                "--min_new_tokens", str(st_min_new),
+                "--retriever", st_retriever,
+                "--retriever_model", st_retriever_model,
+                "--k", str(st_k),
+                "--max_ctx_chars", str(st_max_ctx_chars),
+                "--seg_words", str(st_seg_words),
+                "--overlap_words", str(st_overlap_words),
+            ]
+            _run(cmd_story, timeout=TIMEOUT_STORY, env=base_env)
+
+            story_obj = _read_first_jsonl(out_story)
+            gen = story_obj.get("generation", {}) or {}
+            out_sections = gen.get("sections", []) or []
+
+            # estrai il primo (unico) risultato
+            text = ""
+            if out_sections and isinstance(out_sections[0], dict):
+                raw = out_sections[0].get("text") or out_sections[0].get("narrative") or ""
+                text = _maybe_unwrap_json_text(raw, fixed_title).strip()
+
+            # fallback sulla description dell’outline se vuoto
+            if not text:
+                text = (target_section.get("description") or "").strip()
+
+            sparse_sections[str(t)] = {
+                "title": fixed_title,                      # 🔒 usa esattamente il titolo dell’outline
+                "text": text,
+                "paragraphs": _split_paragraphs(text),
+            }
+        finally:
+            timings["per_section_s"][str(t)] = round(time.time() - start_t, 3)
+            try:
+                shutil.rmtree(workdir, ignore_errors=True)
+            except Exception:
+                pass
+
+    meta = {
+        "req_id": rid,
+        "timings": {**timings},
+        "storyteller_params": {
+            "adapter": story_adapter,
+            "length_preset": st_preset,
+            "temperature": st_temp,
+            "top_p": st_top_p,
+            "max_new_tokens": st_max_new,
+            "min_new_tokens": st_min_new,
+            "retriever": st_retriever,
+            "retriever_model": st_retriever_model,
+            "k": st_k,
+            "max_ctx_chars": st_max_ctx_chars,
+            "seg_words": st_seg_words,
+            "overlap_words": st_overlap_words,
+        },
+        "targets": valid_targets,
+    }
+
+    return {
+        "persona": persona,
+        "paper_title": paper_title,
+        "sections": sparse_sections,
+        "meta": meta,
+    }
