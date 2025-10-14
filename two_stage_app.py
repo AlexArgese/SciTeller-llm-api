@@ -779,3 +779,142 @@ def regen_sections_vm(req: RegenSectionsVMReq, x_api_key: Optional[str] = Header
         "sections": sparse_sections,
         "meta": meta,
     }
+
+# =========================
+# NEW: Rigenerazione paragrafo singolo
+# =========================
+from pydantic import BaseModel
+from typing import List, Dict, Any
+
+class ParagraphOps(BaseModel):
+    paraphrase: bool
+    simplify: bool
+    length_op: str  # "keep" | "shorten" | "lengthen"
+
+class ParagraphOpsReq(BaseModel):
+    persona: str
+    paper_title: str
+    cleaned_text: str
+    section: Dict[str, Any]   # {"title": "...", "text": "...", "paragraphs": [...]}
+    paragraph_index: int
+    ops: ParagraphOps
+    temperature: float = 0.3
+    top_p: float = 0.9
+    n: int = 2
+
+@app.post("/api/regen_paragraph_vm")
+def regen_paragraph_vm(req: ParagraphOpsReq, x_api_key: Optional[str] = Header(default=None)):
+    _require_api_key(x_api_key)
+
+    persona = req.persona or "General Public"
+    paper_title = req.paper_title or "Paper"
+    cleaned_text = req.cleaned_text or ""
+    sec = req.section or {}
+    paragraphs = sec.get("paragraphs") or []
+    title = sec.get("title") or "Section"
+    idx = int(req.paragraph_index)
+    if not paragraphs or idx < 0 or idx >= len(paragraphs):
+        raise HTTPException(422, "invalid paragraph_index or section.paragraphs")
+
+    target_text = paragraphs[idx]
+    context = "\n\n".join(paragraphs[max(0, idx - 1): idx + 2])
+    ops = req.ops
+
+    # Costruisci prompt in stile storyteller ma per 1 paragrafo
+    length_instruction = {
+        "keep": "Keep similar length.",
+        "shorten": "Make it about 20–30% shorter.",
+        "lengthen": "Make it about 20–30% longer."
+    }.get(ops.length_op, "Keep similar length.")
+
+    simplify_instruction = "Use simpler vocabulary and sentences." if ops.simplify else ""
+    paraphrase_instruction = "Paraphrase the text faithfully without changing facts." if ops.paraphrase else "Keep most phrasing unchanged."
+
+    prompt = f"""
+        You are an AI Scientist Storyteller writing for a {persona}.
+        Paper title: {paper_title}
+        Section: {title}
+
+        Context (nearby paragraphs):
+        \"\"\"{context}\"\"\"
+
+        Target paragraph to rewrite:
+        \"\"\"{target_text}\"\"\"
+
+        Rewrite this paragraph following these operations:
+        - {paraphrase_instruction}
+        - {simplify_instruction}
+        - {length_instruction}
+        - Never invent facts, names, or numbers.
+        - Keep the scientific meaning intact.
+        - Write fluent English prose.
+
+        Return ONLY JSON with this schema:
+        {{ "alternatives": [{{"text": "..."}} , ... ] }}
+        Generate {req.n} alternative versions.
+        """.strip()
+
+    # Preparazione workspace temporaneo
+    rid = str(uuid.uuid4())
+    workdir = tempfile.mkdtemp(prefix=f"parops_{rid}_")
+    in_json = os.path.join(workdir, "in.jsonl")
+    out_json = os.path.join(workdir, "out.jsonl")
+
+    record = {
+        "id": rid,
+        "persona": persona,
+        "paper_title": paper_title,
+        "cleaned_text": cleaned_text,
+        "sections": [{"title": title, "description": prompt}],
+    }
+    with open(in_json, "w", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    # GPU environment
+    chosen = pick_best_gpu(min_free_gb=6.0)
+    base_env = dict(os.environ)
+    if chosen:
+        base_env["CUDA_VISIBLE_DEVICES"] = str(chosen["index"])
+    base_env.setdefault("HF_HOME", "/docker/argese/clean_dataset/hf")
+    base_env.setdefault("OFFLOAD_FOLDER", "/docker/argese/offload")
+
+    # esegui storyteller come generatore
+    cmd = [
+        PY, STORYTELLER_SCRIPT,
+        "--in_jsonl", in_json,
+        "--out_jsonl", out_json,
+        "--adapter", STORYTELLER_ADAPTER,
+        "--preset", "medium",
+        "--temperature", str(req.temperature),
+        "--top_p", str(req.top_p),
+        "--max_new_tokens", "512",
+        "--min_new_tokens", "128",
+    ]
+
+    _run(cmd, timeout=TIMEOUT_STORY, env=base_env)
+
+    # parse output
+    try:
+        story_obj = _read_first_jsonl(out_json)
+        gen = story_obj.get("generation") or story_obj.get("output") or {}
+        alts = []
+        if "sections" in gen and isinstance(gen["sections"], list):
+            for s in gen["sections"]:
+                if isinstance(s, dict) and isinstance(s.get("text"), str):
+                    alts.append({"text": s["text"].strip()})
+        elif isinstance(gen.get("text"), str):
+            alts = [{"text": gen["text"].strip()}]
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    if not alts:
+        alts = [{"text": target_text}]
+
+    return {
+        "alternatives": alts[:req.n],
+        "meta": {
+            "applied_ops": ops.dict(),
+            "section_title": title,
+            "paragraph_index": idx,
+        },
+    }
