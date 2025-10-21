@@ -346,6 +346,19 @@ def main():
             outline = item.get("sections") or []
             ctx_full = item.get("cleaned_text") or ""
 
+            custom_prompt = item.get("prompt")
+            if custom_prompt:
+                # bypass: prompt diretto (caso regen_paragraph_vm)
+                gen_full = generate_once(tok, model, custom_prompt, gen_cfg)
+                gen_json_text = extract_first_json_object(gen_full)
+                fout.write(json.dumps({
+                    "id": item.get("id"),
+                    "persona": persona,
+                    "generation": {"text": gen_json_text}
+                }, ensure_ascii=False) + "\n")
+                continue
+
+
             # --- Build retrieval corpus una volta per paper ---
             paragraphs = segment_text(ctx_full, max_words=args.seg_words, overlap=args.overlap_words)
             ret = Retriever(method=args.retriever, model_name=args.retriever_model)
