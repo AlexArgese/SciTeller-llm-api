@@ -1,137 +1,151 @@
 #!/usr/bin/env python3
-#infer_splitter.py
-# -*- coding: utf-8 -*-
+# infer_splitter.py — robust splitter persona-aware con prompt delimitato + truncation sicura
 
-import argparse, os, re, json, sys
+import argparse, os, re, json, sys, math, random
 from typing import List, Dict, Any, Tuple, Optional
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
 from peft import PeftModel
 
+# ---- lightweight tracing (console + optional NDJSON file from env) ----
+from datetime import datetime
+
+TRACE_LOG_FILE = os.environ.get("TRACE_LOG_FILE")
+TRACE_REQ_ID = os.environ.get("TRACE_REQ_ID", "-")
+
+def _now_iso():
+    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+
+def trace(event: str, message: str = "", **data):
+    rec = {"ts": _now_iso(), "req_id": TRACE_REQ_ID, "event": event, "message": message, **data}
+    line = json.dumps(rec, ensure_ascii=False)
+    # write to file (if provided)
+    if TRACE_LOG_FILE:
+        try:
+            with open(TRACE_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+    # always echo to console (stderr) so you see progress immediately
+    try:
+        print(f"[trace] {event} {message} :: {json.dumps(data, ensure_ascii=False)}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
 # -----------------------------
 # Cache helpers (avoid disk quota in $HOME)
 # -----------------------------
 def get_cache_dir() -> Optional[str]:
-    """
-    Returns a preferred cache directory if configured via env.
-    Priority:
-      1) HF_HOME
-      2) HUGGINGFACE_HUB_CACHE
-    Otherwise, None -> default HF cache.
-    """
     return os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE") or None
 
+# -----------------------------
+# Seed per determinismo
+# -----------------------------
+def set_all_seeds(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # -----------------------------
-# Persona-aware instruction & exemplars
+# Persona rubrics (8 principali, semplificate e coerenti)
 # -----------------------------
-INSTR_TEMPLATE = (
-    "Split the paper into {n_sections} logical sections tailored to the specified persona.\n"
-    "For each section, return a JSON object with 'title' and 'description'.\n"
-    "Titles and descriptions MUST reflect the persona's knowledge level and goals.\n"
-    "Respond ONLY with a JSON list (no extra text)."
-)
-
 PERSONA_RUBRICS: Dict[str, Dict[str, Any]] = {
     "General Public": {
-        "style": ("Avoid jargon; use accessible, curiosity-driven titles; "
-                  "explain why the section matters and real-world impact."),
+        "expertise": "Low",
+        "goal": "Understand what AI is and why it matters.",
+        "style": (
+            "Use simple, curiosity-driven language. Avoid jargon and equations. "
+            "Give relatable examples and explain why each section is relevant to everyday life."
+        ),
         "must_have_any": ["Background", "Real-world impact", "Why it matters"],
-        "avoid": ["Ablation", "Complexity analysis"]
+        "avoid": ["Ablation", "Implementation details", "Mathematical proofs"],
     },
-    "Student": {
-        "style": ("Use student-friendly titles; briefly define terms; connect ideas; "
-                  "add learning takeaways in the description."),
-        "must_have_any": ["Background", "Key Concepts", "Takeaways"],
-        "avoid": []
-    },
-    "Teacher": {
-        "style": ("Organize for teaching; emphasize learning objectives, datasets, evaluation setup, and limitations "
-                  "to facilitate classroom discussion."),
-        "must_have_any": ["Learning Objectives", "Evaluation Setup", "Limitations"],
-        "avoid": []
-    },
-    "Researcher": {
-        "style": ("Emphasize novelty, model/algorithm design choices, dataset composition, baselines, metrics, "
-                  "ablations, and threats to validity."),
-        "must_have_any": ["Model Architecture", "Training and Evaluation", "Ablation", "Results"],
-        "avoid": []
-    },
-    "Engineer": {
-        "style": ("Highlight implementation details, data formats, preprocessing, reproducibility, and integration concerns."),
-        "must_have_any": ["Implementation Details", "Reproducibility", "Data Pipeline"],
-        "avoid": []
-    },
-    "Clinician": {
-        "style": ("Prioritize clinical relevance, cohorts, endpoints, inclusion/exclusion criteria, and validation on clinical outcomes."),
-        "must_have_any": ["Clinical Relevance", "Validation", "Cohort/Endpoints"],
-        "avoid": []
-    },
-    "Product Manager": {
-        "style": ("Focus on user value, risks, constraints, scalability, and regulatory considerations; avoid low-level math."),
-        "must_have_any": ["Value Proposition", "Risks & Constraints", "Scalability"],
-        "avoid": ["Training Loss Curves"]
-    },
+
     "Investor": {
-        "style": ("Prioritize market context, competitive landscape, potential applications, risks, and differentiators. "
-                  "Keep technical depth shallow unless directly tied to moat or scale."),
-        "must_have_any": ["Background", "Market/Applications", "Risks", "Differentiators"],
-        "avoid": ["Ablation", "Proofs"]
+        "expertise": "Low–Medium",
+        "goal": "Spot AI trends for business or funding decisions.",
+        "style": (
+            "Focus on market potential, differentiation, scalability, and risks. "
+            "Avoid technical depth unless tied to business value."
+        ),
+        "must_have_any": ["Market/Applications", "Value Proposition", "Risks"],
+        "avoid": ["Ablation", "Proofs", "Training losses"],
     },
-    "Reviewer": {
-        "style": ("Be critical; surface assumptions, confounders, missing ablations, generalization claims, and threats to validity."),
-        "must_have_any": ["Assumptions", "Limitations", "Ablations"],
-        "avoid": []
+
+    "Student": {
+        "expertise": "Medium",
+        "goal": "Learn AI fundamentals and expand technical knowledge.",
+        "style": (
+            "Use educational tone with short definitions and examples. "
+            "Highlight key concepts, motivation, and what the reader should learn."
+        ),
+        "must_have_any": ["Key Concepts", "Motivation", "Takeaways"],
+        "avoid": [],
+    },
+
+    "Journalist": {
+        "expertise": "Medium",
+        "goal": "Report clearly and accurately on AI developments.",
+        "style": (
+            "Write as if explaining to an informed but non-technical audience. "
+            "Emphasize significance, societal implications, and credible results."
+        ),
+        "must_have_any": ["Background", "Results", "Implications"],
+        "avoid": ["Mathematical derivations", "Code-level details"],
+    },
+
+    "Developer": {
+        "expertise": "Medium–High",
+        "goal": "Apply models, tools, and frameworks in real-world projects.",
+        "style": (
+            "Be practical. Focus on implementation details, datasets, and reproducibility. "
+            "Mention tools, APIs, or frameworks relevant to applying the method."
+        ),
+        "must_have_any": ["Implementation Details", "Reproducibility", "Use Cases"],
+        "avoid": ["Abstract Theories", "Marketing claims"],
+    },
+
+    "Policy Maker": {
+        "expertise": "Medium–High",
+        "goal": "Assess the social, ethical, and legal implications of AI.",
+        "style": (
+            "Prioritize transparency, accountability, and governance. "
+            "Avoid deep technical discussion; emphasize societal impact and ethics."
+        ),
+        "must_have_any": ["Ethical Implications", "Regulation", "Societal Impact"],
+        "avoid": ["Optimization details", "Model internals"],
+    },
+
+    "Teacher": {
+        "expertise": "High",
+        "goal": "Teach AI concepts and methods effectively to others.",
+        "style": (
+            "Organize clearly for instructional purposes. Emphasize learning objectives, "
+            "key examples, and limitations to encourage critical thinking."
+        ),
+        "must_have_any": ["Learning Objectives", "Examples", "Limitations"],
+        "avoid": [],
+    },
+
+    "Researcher": {
+        "expertise": "High",
+        "goal": "Produce or track cutting-edge AI research and experimental results.",
+        "style": (
+            "Be concise and technical. Focus on novelty, methodology, datasets, results, "
+            "and limitations. Use formal academic tone."
+        ),
+        "must_have_any": ["Methodology", "Experiments", "Results", "Limitations"],
+        "avoid": ["Marketing tone", "Simplified analogies"],
     },
 }
 
-FEW_SHOT = """
-### Few-shot Persona Exemplars (for shaping section granularity)
-
-[Persona: Investor]
-Output (example):
-[
-  {"title":"Background on Generative Models","description":"Brief context and progress relevant for non-experts."},
-  {"title":"Jukebox Architecture","description":"High-level components tied to differentiation."},
-  {"title":"Controlling Music Generation","description":"What knobs exist and why they matter commercially."},
-  {"title":"Sampling Methods","description":"What affects output quality/time-to-sample."},
-  {"title":"Applications & Moat","description":"Potential markets, risks, differentiators."}
-]
-
-[Persona: Researcher]
-Output (example):
-[
-  {"title":"Model Architecture","description":"VQ-VAE hierarchy, priors, upsamplers."},
-  {"title":"Training and Evaluation","description":"Objectives, spectral loss, datasets, metrics."},
-  {"title":"Controlling Generation","description":"Conditioning details and limitations."},
-  {"title":"Results and Ablations","description":"Comparisons, ablations, failure modes."},
-  {"title":"Related Work","description":"Positioning vs prior art."}
-]
-""".strip()
-
-def _persona_block(persona: str, style_strength: int, n_sections: int) -> str:
-    spec = PERSONA_RUBRICS.get(persona, PERSONA_RUBRICS["General Public"])
-    must_any = spec.get("must_have_any", [])
-    avoid = spec.get("avoid", [])
-    style = spec.get("style", "")
-
-    lines = [
-        f"Persona: {persona}",
-        f"Persona guidelines (strength {style_strength}/5): {style}",
-        f"Target sections: {n_sections}",
-        "All section titles/descriptions MUST be grounded in the paper text; no inventions.",
-    ]
-    if must_any:
-        lines.append(f"At least one section title MUST include one of: {', '.join(must_any)}.")
-    if avoid:
-        lines.append(f"Avoid section titles about: {', '.join(avoid)}.")
-    return "\n".join(lines)
-
-
 # -----------------------------
-# Markdown cleaning
+# Markdown cleaning (come nel tuo, con piccole rifiniture)
 # -----------------------------
 COMMENT_RE = re.compile(r'^\s*<!--\s*(\{.*?\})\s*-->\s*$', re.IGNORECASE)
 H1_RE = re.compile(r'^\s*#\s+(.*)')
@@ -154,13 +168,6 @@ def _looks_like_figure_caption(line: str) -> bool:
     return bool(re.match(r'^(fig(\.|ure)?|tab(\.|le)?)\s*[\d:.\- ]', s, re.IGNORECASE))
 
 def fix_line_wraps(text: str) -> str:
-    """
-    Fix common PDF line-wrapping artifacts without harming real hyphenated compounds.
-    - Remove soft hyphen (U+00AD).
-    - De-hyphenate word breaks across newlines: 'intro-\\nduces' -> 'introduces'.
-    - De-hyphenate word breaks with spaces: 'intro-   duces' -> 'introduces'.
-    - Merge single newlines inside sentences: 'models,\\nwhich' -> 'models, which'.
-    """
     text = text.replace("\u00ad", "")
     text = re.sub(r"(\w)[-\u2010\u2011]\s*\n\s*(\w)", r"\1\2", text)
     text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
@@ -201,15 +208,8 @@ def drop_figure_table_headings(text: str) -> str:
     return "\n".join(lines)
 
 def clean_pdf_markdown(md_text: str) -> Tuple[Optional[str], str]:
-    """
-    - Removes blocks marked by HTML comments (table/image/figure/header/footer)
-    - Removes markdown table lines and inline images ![](...)
-    - Stops at '## References/Appendix/...'
-    - Extracts the H1 as title (if present)
-    """
     title = None
     out_lines: List[str] = []
-
     skip_types = {"table", "image", "figure", "header", "footer"}
     current_block_type: Optional[str] = None
     stop_now = False
@@ -236,12 +236,9 @@ def clean_pdf_markdown(md_text: str) -> Tuple[Optional[str], str]:
         if current_block_type in skip_types:
             continue
 
-        if _is_table_line(line):
-            continue
-        if re.search(r'!\[[^\]]*\]\([^)]+\)', line):
-            continue
-        if _looks_like_figure_caption(line):
-            continue
+        if _is_table_line(line): continue
+        if re.search(r'!\[[^\]]*\]\([^)]+\)', line): continue
+        if _looks_like_figure_caption(line): continue
 
         m1 = H1_RE.match(line)
         if m1 and title is None:
@@ -249,7 +246,6 @@ def clean_pdf_markdown(md_text: str) -> Tuple[Optional[str], str]:
             continue
 
         out_lines.append(line)
-
         if HX_RE.match(line):
             current_block_type = None
 
@@ -260,58 +256,139 @@ def clean_pdf_markdown(md_text: str) -> Tuple[Optional[str], str]:
     text = fix_common_academic_artifacts(text)
     return title, text
 
+# -----------------------------
+# Prompt building con delimitatori + schema
+# -----------------------------
+INSTR_TEMPLATE = (
+    "You are an AI paper splitter. Split the paper into exactly {n_sections} logical sections "
+    "tailored to the specified Persona."
+)
 
-# -----------------------------
-# Prompt building
-# -----------------------------
-TEXT_KEYS = ["paper_text", "text", "content", "full_text", "body"]
-TITLE_KEYS = ["paper_title", "title"]
+def _persona_block(persona: str, style_strength: int, n_sections: int) -> str:
+    spec = PERSONA_RUBRICS.get(persona, PERSONA_RUBRICS["General Public"])
+    must_any = spec.get("must_have_any", [])
+    avoid = spec.get("avoid", [])
+    style = spec.get("style", "")
+
+    lines = [
+        f"Persona: {persona}",
+        f"Persona style (strength {style_strength}/5): {style}",
+        f"Target sections: {n_sections}",
+        "All titles/descriptions MUST be grounded in the paper text (no fabrication).",
+    ]
+    if must_any:
+        lines.append(f"At least one section title MUST include one of: {', '.join(must_any)}.")
+    if avoid:
+        lines.append(f"Avoid section titles about: {', '.join(avoid)}.")
+    return "\n".join(lines)
 
 def build_prompt(persona: str, title: str, paper_text: str,
                  n_sections: int = 5, style_strength: int = 3,
                  include_few_shot: bool = False) -> str:
-    persona = persona or "General Public"
-    user_lines = []
-    if title:
-        user_lines.append(f"Title: {title}")
-    user_lines.append(_persona_block(persona, style_strength, n_sections))
-    user_lines.append("Paper text:")
-    user_lines.append(paper_text)
-    user_text = "\n".join(user_lines)
-
+    """
+    Prompt con tag espliciti e JSON schema chiaro. Riduce instabilità di formato.
+    """
     instr = INSTR_TEMPLATE.format(n_sections=n_sections if isinstance(n_sections, int) else "~5")
-    few_shot = (f"\n\n### Exemplars:\n{FEW_SHOT}\n" if include_few_shot else "")
+    persona_block = _persona_block(persona, style_strength, n_sections)
+
+    few_shot = ""
+    if include_few_shot:
+        few_shot = (
+            "\n<EXEMPLARS>\n"
+            "[Persona: Investor]\n"
+            "[{\"title\":\"Background on Generative Models\",\"description\":\"Brief context relevant for non-experts.\"},"
+            "{\"title\":\"Architecture\",\"description\":\"High-level components tied to differentiation.\"},"
+            "{\"title\":\"Applications & Moat\",\"description\":\"Potential markets, risks, differentiators.\"}]\n"
+            "[Persona: Researcher]\n"
+            "[{\"title\":\"Model Architecture\",\"description\":\"Key modules and design choices.\"},"
+            "{\"title\":\"Training & Evaluation\",\"description\":\"Objectives, datasets, metrics.\"},"
+            "{\"title\":\"Results & Ablations\",\"description\":\"Comparisons, ablations, failure modes.\"}]\n"
+            "</EXEMPLARS>\n"
+        )
+
+    schema = (
+        "<SCHEMA>\n"
+        "Return ONLY a JSON list of objects, no markdown, no preface.\n"
+        "Schema: [ {{\"title\":\"...\",\"description\":\"...\"}}, ... ]\n"
+        "Constraints:\n"
+        f"- Exactly {n_sections} items.\n"
+        "- Titles: <= 10 words, persona-appropriate.\n"
+        "- Descriptions: 1–2 sentences, grounded in the paper.\n"
+        "- English only.\n"
+        "</SCHEMA>\n"
+    )
+
 
     prompt = (
-        f"### Instruction:\n{instr}{few_shot}\n"
-        f"### Input:\n{user_text}\n\n"
-        f"### Response:\n"
+        "<INSTRUCTION>\n" + instr + "\n</INSTRUCTION>\n"
+        "<PERSONA_GUIDE>\n" + persona_block + "\n</PERSONA_GUIDE>\n"
+        + few_shot +
+        "<TITLE>\n" + (title or "Untitled") + "\n</TITLE>\n"
+        "<PAPER>\n" + paper_text + "\n</PAPER>\n"
+        + schema +
+        "<RESPONSE>\n"
+        "Return the list inside <JSON> tags strictly.\n"
+        "<JSON>\n"
     )
     return prompt
 
+# -----------------------------
+# JSON extraction robusto
+# -----------------------------
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.I)
+    return s.strip()
 
 def extract_json_list(text: str) -> List[Dict[str, Any]]:
     """
-    Extracts the FIRST plausible JSON list [...] from generated text.
+    Estrae la PRIMA lista JSON plausibile.
+    Priorità: contenuto tra <JSON>...</JSON>, altrimenti primo blocco [ ... ] bilanciato.
     """
-    s = text.strip()
-    if "### Response:" in s:
-        s = s.split("### Response:", 1)[1].strip()
-    start = s.find("[")
-    end = s.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        chunk = s[start:end + 1]
+    s = _strip_code_fences(text)
+    # 1) tag <JSON>
+    m = re.search(r"<JSON>\s*(\[.*?\])\s*</JSON>", s, flags=re.S)
+    if m:
+        cand = m.group(1)
         try:
-            obj = json.loads(chunk)
+            obj = json.loads(cand)
             if isinstance(obj, list):
                 return obj
         except Exception:
             pass
+    # 2) primo [ ... ] bilanciato
+    start = s.find("[")
+    if start != -1:
+        depth, i, in_str, esc = 0, start, False, False
+        while i < len(s):
+            ch = s[i]
+            if in_str:
+                if esc: esc = False
+                elif ch == "\\": esc = True
+                elif ch == '"': in_str = False
+            else:
+                if ch == '"': in_str = True
+                elif ch == "[": depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        chunk = s[start:i+1]
+                        try:
+                            obj = json.loads(chunk)
+                            if isinstance(obj, list):
+                                return obj
+                        except Exception:
+                            break
+            i += 1
+    # 3) fallback: prova parse diretto
     try:
-        return json.loads(s)
+        obj = json.loads(s)
+        if isinstance(obj, list):
+            return obj
     except Exception:
-        return []
-
+        pass
+    return []
 
 # -----------------------------
 # Model loading
@@ -332,15 +409,57 @@ def load_model_and_tokenizer(base_model: str, adapter_path: str):
     try:
         model = PeftModel.from_pretrained(base, adapter_path, cache_dir=cache_dir)
     except TypeError:
-        # Older PEFT may not support cache_dir
         model = PeftModel.from_pretrained(base, adapter_path)
     model.eval()
+    # usa cache per stabilità/latenza
+    try:
+        model.config.use_cache = True
+    except Exception:
+        pass
     return tok, model
 
+# -----------------------------
+# Truncation budgeting
+# -----------------------------
+def max_ctx_len(model) -> int:
+    return int(getattr(model.config, "max_position_embeddings", 8192))
+
+def truncate_for_budget(tok, model, prompt_prefix: str, paper_text: str, max_new_tokens: int, safety_margin: int = 256) -> Tuple[str, bool]:
+    """
+    Garantisce che (prompt_prefix + paper_text) + max_new_tokens <= max_pos - safety_margin.
+    Taglia paper_text se necessario e ritorna (paper_text_trunc, was_truncated).
+    """
+    max_pos = max_ctx_len(model)
+    # tokenizza prefix + paper per stimare
+    ids_prefix = tok(prompt_prefix, add_special_tokens=False).input_ids
+    ids_paper = tok(paper_text, add_special_tokens=False).input_ids
+
+    budget_input = max_pos - max_new_tokens - safety_margin
+    need = len(ids_prefix) + len(ids_paper)
+    if need <= budget_input:
+        return paper_text, False
+
+    # taglia paper_text per rientrare
+    allow = max(0, budget_input - len(ids_prefix))
+    if allow <= 0:
+        # caso limite: tieni solo finale del paper per massimizzare chance di sezioni con “Results/Conclusion”
+        keep_ids = ids_paper[-max(0, budget_input // 2):]
+    else:
+        keep_ids = ids_paper[:allow]
+    paper_trunc = tok.decode(keep_ids, skip_special_tokens=True)
+    return paper_trunc, True
 
 # -----------------------------
 # Generation
 # -----------------------------
+def normalize_title(t: str) -> str:
+    s = (t or "").strip()
+    s = re.sub(r'^\s*#+\s*', '', s)                 # rimuovi heading markdown
+    s = re.sub(r'^\s*\d+[\).\-:\s]+\s*', '', s)     # rimuovi numerazioni
+    s = s.strip('"').strip("'").strip("`").strip()
+    s = re.sub(r'\s{2,}', ' ', s)
+    return s
+
 def generate_sections(
     tok, model,
     persona: str, title: str, paper_text: str,
@@ -349,18 +468,40 @@ def generate_sections(
     top_p: float = 0.9,
     n_sections: int = 5,
     style_strength: int = 3,
-    include_few_shot: bool = False):
+    include_few_shot: bool = False,
+    truncation_margin: int = 256,
+    stderr_log: bool = True):
+
+    # costruiamo prima un prompt "scheletro" per calcolare il budget
+    skeleton = (
+        "<INSTRUCTION>\n"
+        f"You are an AI paper splitter. Split the paper into exactly {n_sections} logical sections tailored to the Persona.\n"
+        "</INSTRUCTION>\n"
+        "<PERSONA_GUIDE>\n" + _persona_block(persona, style_strength, n_sections) + "\n</PERSONA_GUIDE>\n"
+        "<TITLE>\n" + (title or "Untitled") + "\n</TITLE>\n"
+        "<PAPER>\n"
+    )
+
+    paper_fit, was_trunc = truncate_for_budget(
+        tok, model, prompt_prefix=skeleton, paper_text=paper_text,
+        max_new_tokens=max_new_tokens, safety_margin=truncation_margin
+    )
+
+    if was_trunc and stderr_log:
+        cut_pct = 100.0 * (1.0 - (len(paper_fit) / max(1, len(paper_text))))
+        print(f"[splitter] WARNING: paper truncated by ~{cut_pct:.1f}% to fit context budget", file=sys.stderr)
 
     prompt = build_prompt(
-        persona, title, paper_text,
+        persona, title, paper_fit,
         n_sections=n_sections, style_strength=style_strength,
         include_few_shot=include_few_shot
     )
-    inputs = tok(prompt, return_tensors="pt").to(model.device)
+
+    inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=max_ctx_len(model)).to(model.device)
 
     do_sample = temperature > 0.0
     gen_cfg = GenerationConfig(
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=int(max_new_tokens),
         temperature=float(temperature),
         top_p=float(top_p) if do_sample else 1.0,
         do_sample=do_sample,
@@ -371,28 +512,32 @@ def generate_sections(
     )
     with torch.no_grad():
         out = model.generate(**inputs, generation_config=gen_cfg)
-    text_out = tok.decode(out[0], skip_special_tokens=True)
-    sections = extract_json_list(text_out)
+    text_out_full = tok.decode(out[0], skip_special_tokens=True)
+
+    # prendi solo ciò che è dopo <JSON> se presente
+    sections = extract_json_list(text_out_full)
 
     cleaned = []
     for it in sections:
         if isinstance(it, dict):
-            t = str(it.get("title", "")).strip()
+            t = normalize_title(str(it.get("title", "")))
             d = str(it.get("description", "")).strip()
             if t or d:
                 cleaned.append({"title": t, "description": d})
+    # Se il modello ha generato meno di n_sections, non forzare: è meglio restituire quello che c’è (robusto).
     return cleaned
-
 
 # -----------------------------
 # Input handling
 # -----------------------------
+TEXT_KEYS = ["paper_text", "text", "content", "full_text", "body"]
+TITLE_KEYS = ["paper_title", "title"]
+
 def _load_inputs_any(path: str) -> List[Dict[str, Any]]:
     """
     Supports:
       - .jsonl with records containing: persona + (paper_text|text|content) OR markdown in 'md'
-      - .md: requires --persona
-      - .txt: same as .md
+      - .md/.txt: requires --persona
     """
     if path.lower().endswith(".jsonl"):
         ds = load_dataset("json", data_files=path, split="train")
@@ -423,7 +568,6 @@ def _load_inputs_any(path: str) -> List[Dict[str, Any]]:
             content = f.read()
         return [{"id": None, "persona": None, "md": content, "title": None}]
 
-
 # -----------------------------
 # Main
 # -----------------------------
@@ -447,7 +591,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="Creativity of section generation (0.0 = deterministic)")
     ap.add_argument("--top_p", type=float, default=0.9,
-                help="Nucleus sampling for splitter when temperature > 0.")
+                    help="Nucleus sampling for splitter when temperature > 0.")
 
     # Persona-aware knobs
     ap.add_argument("--sections", type=int, default=5,
@@ -457,10 +601,22 @@ def main():
     ap.add_argument("--few_shot", action="store_true",
                     help="Include short persona exemplars in the prompt.")
 
+    # NEW: controlli di budgeting
+    ap.add_argument("--safety_margin", type=int, default=256,
+                    help="Token margin to leave free in the context window (default 256).")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed (default 42).")
+
     args = ap.parse_args()
+    set_all_seeds(args.seed)
+
+    trace("splitter.model_loaded", "Splitter model loaded.",
+          base_model=args.base_model, adapter=args.adapter_path, max_new_tokens=args.max_new_tokens,
+          temperature=args.temperature, top_p=args.top_p, sections=args.sections)
+
 
     # Load model
     tok, model = load_model_and_tokenizer(args.base_model, args.adapter_path)
+    
 
     # Load inputs
     inputs = _load_inputs_any(args.input_path)
@@ -482,29 +638,44 @@ def main():
             pre_title = ex.get("title") or ""
             rid = ex.get("id")
 
+            trace("splitter.item.start", "Starting split for item.",
+              persona=persona, provided_title=pre_title)            
+
             # Clean markdown and get title
             title_md, cleaned_text = clean_pdf_markdown(raw_md)
             title = pre_title or title_md or ""
 
+            trace("splitter.markdown.cleaned", "Markdown cleaned.",
+              detected_title=title, paper_chars=len(cleaned_text))
+
             # se l'utente NON ha specificato style_strength, ricavalo dalla temperature
             style_strength = args.style_strength
             if style_strength is None or str(style_strength).strip() == "":
-                # mappa 0.0 → 2, 0.5 → 4, 1.0 → 5 (clamp 1..5)
                 style_strength = max(1, min(5, int(round(2 + args.temperature * 3))))
+                
+            trace("splitter.generate.begin", f"Generating {args.sections} section candidates…")
 
-
-            # Generate sections
+            # Generate sections (con truncation budgeting)
             sections = generate_sections(
                 tok, model, persona, title, cleaned_text,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
-                top_p=args.top_p,                  # <— importante
+                top_p=args.top_p,
                 n_sections=args.sections,
-                style_strength=style_strength,     # se l’hai derivato dalla temp, usa la variabile
+                style_strength=style_strength,
                 include_few_shot=bool(args.few_shot),
+                truncation_margin=int(args.safety_margin),
+                stderr_log=True
             )
 
-            # Record out
+            sec_titles = [ (it.get("title") or "").strip() for it in sections ]
+            trace("splitter.generate.done", f"Detected {len(sections)} section candidates.",
+                  titles=sec_titles)
+            if sec_titles:
+                # primo titolo leggibile
+                trace("splitter.section.detected", f"Detected first section '{sec_titles[0]}'…", first=sec_titles[0])
+
+
             rec_out = {
                 "id": rid,
                 "persona": persona,
@@ -513,16 +684,19 @@ def main():
                 "num_sections": len(sections),
                 "temperature": args.temperature,
                 "cleaned_text": cleaned_text,
-                # extra metadata for audit/debug
+                # extra metadata per audit/debug
                 "n_sections_target": args.sections,
-                "style_strength": args.style_strength,
+                "style_strength": style_strength,
                 "few_shot": bool(args.few_shot),
+                "safety_margin": int(args.safety_margin),
+                "seed": int(args.seed),
             }
             fout.write(json.dumps(rec_out, ensure_ascii=False) + "\n")
             n_ok += 1
 
     print(f"[✓] Saved -> {args.output_jsonl} ({n_ok} records)")
-
+    trace("splitter.output.saved", "Splitter output saved.", path=args.output_jsonl, records=n_ok)
+    
 
 if __name__ == "__main__":
     main()
